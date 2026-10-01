@@ -97,6 +97,25 @@ def configure_udev_autosuspend():
     subprocess.run(["udevadm", "control", "--reload-rules"], check=False)
     subprocess.run(["udevadm", "trigger"], check=False)
 
+    # Pasang systemd service agar permanen saat boot
+    service_path = Path("/etc/systemd/system/disable-audio-autosuspend.service")
+    service_content = r"""[Unit]
+Description=Disable PCI Autosuspend for Intel SOF Audio DSP and I2C Controller
+After=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "for p in /sys/bus/pci/devices/0000:00:0e.0/power/control /sys/bus/pci/devices/0000:00:16.*/power/control; do echo on > \"\$p\" 2>/dev/null || true; done"
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+    service_path.write_text(service_content)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "disable-audio-autosuspend.service"], check=False)
+    print_success("Systemd service disable-audio-autosuspend berhasil diaktifkan.")
+
     # Terapkan langsung ke sysfs jika ada
     pci_power_path = Path("/sys/bus/pci/devices/0000:00:0e.0/power/control")
     if pci_power_path.exists():
@@ -132,6 +151,7 @@ def configure_alsa_ucm():
 		cset "name='Internal Mic Switch' off"
 		cset "name='DAC Mono Mix Switch' off"
 		cset "name='Speaker Switch' on"
+		cset "name='Headphone Mixer Volume' 11"
 	]
 }
 
@@ -202,6 +222,7 @@ SectionDevice."Speaker" {
 
 	EnableSequence [
 		cset "name='Speaker Switch' on"
+		cset "name='Headphone Mixer Volume' 11"
 	]
 
 	DisableSequence [
@@ -212,7 +233,7 @@ SectionDevice."Speaker" {
 		PlaybackPCM "hw:${CardId}"
 		# The es8316 only has a HP-amp which is muxed to the speaker
 		# or to the headpones output
-		PlaybackMixerElem "Headphone Mixer"
+		PlaybackMixerElem "DAC"
 		PlaybackMasterElem "DAC"
 	}
 }
@@ -226,6 +247,7 @@ SectionDevice."Headphones" {
 
 	EnableSequence [
 		cset "name='Headphone Switch' on"
+		cset "name='Headphone Mixer Volume' 11"
 	]
 
 	DisableSequence [
@@ -235,7 +257,7 @@ SectionDevice."Headphones" {
 	Value {
 		PlaybackPriority 100
 		PlaybackPCM "hw:${CardId}"
-		PlaybackMixerElem "Headphone Mixer"
+		PlaybackMixerElem "DAC"
 		PlaybackMasterElem "DAC"
 		# JackControl "Headphone Jack"
 		# JackHWMute "Speaker"
@@ -310,6 +332,27 @@ table.insert(alsa_monitor.rules, {
 """
     lua_file.write_text(lua_content)
 
+    # Blokir aplikasi agar tidak bisa mengubah volume master
+    pw_pulse_dir = user_home / ".config" / "pipewire" / "pipewire-pulse.conf.d"
+    pw_pulse_dir.mkdir(parents=True, exist_ok=True)
+    block_conf = pw_pulse_dir / "block-sink-volume.conf"
+    block_conf.write_text("""pulse.rules = [
+    {
+        matches = [
+            { application.name = "~.*\\.exe$" }
+            { application.process.binary = "~.*wine.*" }
+            { application.name = "~.*(gta|hl2|garry).*" }
+        ]
+        actions = {
+            quirks = [ block-sink-volume ]
+        }
+    }
+]
+""")
+    os.chown(block_conf, uid, gid)
+    os.chown(pw_pulse_dir, uid, gid)
+    os.chown(pw_pulse_dir.parent, uid, gid)
+
     # Perbaiki kepemilikan file/folder ke user asli
     os.chown(lua_file, uid, gid)
     os.chown(wp_dir, uid, gid)
@@ -326,6 +369,7 @@ def apply_alsa_mixer_settings():
         ["amixer", "-c", "sofessx8336", "sset", "Headphone", "off"],
         ["amixer", "-c", "sofessx8336", "sset", "DAC", "100%"],
         ["amixer", "-c", "sofessx8336", "sset", "Headphone Mixer", "100%"],
+        ["amixer", "-c", "sofessx8336", "sset", "DAC Mono Mix", "on"],
         ["alsactl", "store"],
     ]
 
@@ -354,12 +398,128 @@ def apply_pipewire_user_settings(user_name):
     print_success("Pengaturan PipeWire selesai diterapkan.")
 
 
+def configure_keyboard_shortcuts(user_name):
+    """Mengonfigurasi shortcut keyboard F3 (Volume -) dan F4 (Volume +) beserta notifikasi OSD di XFCE."""
+    print_info("7. Mengonfigurasi shortcut keyboard volume (F3 / F4) & notifikasi OSD...")
+
+    vol_script = Path("/usr/local/bin/volume-control")
+    vol_script_content = """#!/bin/bash
+case "$1" in
+  up)
+    pactl set-sink-volume @DEFAULT_SINK@ +5%
+    ;;
+  down)
+    pactl set-sink-volume @DEFAULT_SINK@ -5%
+    ;;
+  mute)
+    pactl set-sink-mute @DEFAULT_SINK@ toggle
+    ;;
+esac
+
+VOL=$(pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -Po '[0-9]+(?=%)' | head -1)
+MUTE=$(pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null | grep -o 'yes')
+
+if [ "$MUTE" = "yes" ]; then
+  notify-send -t 1000 -h string:x-canonical-private-synchronous:volume -i audio-volume-muted "Volume" "Muted"
+else
+  if [ -n "$VOL" ]; then
+    if [ "$VOL" -ge 70 ]; then
+      ICON="audio-volume-high"
+    elif [ "$VOL" -ge 30 ]; then
+      ICON="audio-volume-medium"
+    else
+      ICON="audio-volume-low"
+    fi
+    notify-send -t 1000 -h string:x-canonical-private-synchronous:volume -h int:value:"$VOL" -i "$ICON" "Volume" "${VOL}%"
+  fi
+fi
+"""
+    vol_script.write_text(vol_script_content)
+    vol_script.chmod(0o755)
+
+    shortcuts = [
+        ("F3", "/usr/local/bin/volume-control down"),
+        ("F4", "/usr/local/bin/volume-control up"),
+        ("XF86AudioLowerVolume", "/usr/local/bin/volume-control down"),
+        ("XF86AudioRaiseVolume", "/usr/local/bin/volume-control up"),
+        ("XF86AudioMute", "/usr/local/bin/volume-control mute"),
+    ]
+
+    for key, cmd in shortcuts:
+        q_cmd = f"xfconf-query -c xfce4-keyboard-shortcuts -p '/commands/custom/{key}' -n -t string -s '{cmd}'"
+        subprocess.run(["su", "-", user_name, "-c", q_cmd], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Muat ulang daemon shortcut XFCE
+    subprocess.run(["su", "-", user_name, "-c", "DISPLAY=:0.0 xfsettingsd --replace &"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print_success("Shortcut F3 (Vol -), F4 (Vol +), dan notifikasi OSD berhasil dipasang.")
+
+
 def test_sound(user_name):
     """Tes pemutaran suara pendek."""
     wav_path = "/usr/share/sounds/alsa/Front_Center.wav"
     if Path(wav_path).exists():
         print_info("Memutar sampel suara tes...")
         subprocess.run(["su", "-", user_name, "-c", f"paplay {wav_path} || aplay {wav_path}"], check=False)
+
+
+def configure_audio_guardian():
+    """Memasang Audio Guardian daemon untuk kekebalan suara (anti suara hilang)."""
+    print_info("8. Memasang Audio Guardian Daemon (Anti Suara Hilang)...")
+    daemon_script = Path("/usr/local/bin/audio-guardian")
+    daemon_content = r"""#!/bin/bash
+# Audio Guardian - Anti Suara Hilang & Pelindung Audio ES8336
+PCI_POWER="/sys/bus/pci/devices/0000:00:0e.0/power/control"
+
+while true; do
+    if [ -f "$PCI_POWER" ]; then
+        if ! grep -q "^on$" "$PCI_POWER" 2>/dev/null; then
+            echo on > "$PCI_POWER" 2>/dev/null
+        fi
+    fi
+
+    HP_JACK=$(amixer -c sofessx8336 cget name="Headphone Jack" 2>/dev/null | grep -Po "values=\\K\\w+")
+    
+    if amixer -c sofessx8336 get "Speaker" 2>/dev/null | grep -q "\\[off\\]"; then
+        amixer -c sofessx8336 sset "Speaker" on >/dev/null 2>&1
+    fi
+    if amixer -c sofessx8336 get "Headphone" 2>/dev/null | grep -q "\\[off\\]"; then
+        amixer -c sofessx8336 sset "Headphone" on >/dev/null 2>&1
+    fi
+
+    if ! amixer -c sofessx8336 get "Headphone Mixer" 2>/dev/null | grep -q "Front Left: 11 "; then
+        amixer -c sofessx8336 sset "Headphone Mixer" 100% >/dev/null 2>&1
+    fi
+
+    if amixer -c sofessx8336 get "DAC Mono Mix" 2>/dev/null | grep -q "\[off\]"; then
+        amixer -c sofessx8336 sset "DAC Mono Mix" on >/dev/null 2>&1
+    fi
+
+    sleep 2
+done
+"""
+    daemon_script.write_text(daemon_content)
+    daemon_script.chmod(0o755)
+
+    svc_path = Path("/etc/systemd/system/audio-guardian.service")
+    svc_content = """[Unit]
+Description=Audio Guardian - Anti Suara Hilang & Pelindung Audio ES8336
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/audio-guardian
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+"""
+    svc_path.write_text(svc_content)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "audio-guardian.service"], check=False)
+    print_success("Audio Guardian Daemon berhasil aktif!")
 
 
 def main():
@@ -376,9 +536,11 @@ def main():
     configure_wireplumber(user_name, uid, gid, user_home)
     apply_alsa_mixer_settings()
     apply_pipewire_user_settings(user_name)
+    configure_keyboard_shortcuts(user_name)
+    configure_audio_guardian()
 
     print("\n" + "=" * 60)
-    print_success("SEMUA KONFIGURASI AUDIO TELAH BERHASIL DIPASANG!")
+    print_success("SEMUA KONFIGURASI AUDIO & SHORTCUT TELAH BERHASIL DIPASANG!")
     print("=" * 60)
     print_info("Catatan:")
     print("1. Jika laptop baru saja di-install ulang, silakan REBOOT komputer")
